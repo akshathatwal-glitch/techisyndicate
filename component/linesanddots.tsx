@@ -1,7 +1,6 @@
 // @ts-nocheck
 
 "use client"
-
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Plus, Search, X, Link2, Trash2, ZoomIn, ZoomOut, Maximize2 } from "lucide-react";
 
@@ -154,6 +153,8 @@ export default function GraphCanvas() {
     return seedEdges.map(([source, target]) => ({ source, target }));
   });
   const [view, setView] = useState({ offsetX: 0, offsetY: 0, scale: 0.85 });
+  const targetViewRef = useRef({ offsetX: 0, offsetY: 0, scale: 0.85 }); // where zoom is animating toward
+  const zoomAnimRef = useRef(null);
   const [selected, setSelected] = useState(null); // node id shown in side panel
   const [linkMode, setLinkMode] = useState(false);
   const [linkSource, setLinkSource] = useState(null);
@@ -190,6 +191,10 @@ export default function GraphCanvas() {
     window.localStorage.removeItem(STORAGE_KEY);
     window.location.reload();
   }
+
+  useEffect(() => {
+    return () => { if (zoomAnimRef.current) cancelAnimationFrame(zoomAnimRef.current); };
+  }, []);
 
   // ---- physics simulation ----------------------------------------------
   useEffect(() => {
@@ -276,22 +281,63 @@ export default function GraphCanvas() {
     panRef.current = { startX: e.clientX, startY: e.clientY, offX: view.offsetX, offY: view.offsetY };
     movedRef.current = false;
   }
+  // ---- smooth zoom animation ---------------------------------------------
+  // Wheel/button zoom sets a target; this loop eases the visible view
+  // toward it each frame instead of snapping straight there. Panning stays
+  // instant (feels better for dragging), only scale changes are eased.
+  function animateToTarget() {
+    if (zoomAnimRef.current) return;
+    function step() {
+      setView((v) => {
+        const t = targetViewRef.current;
+        const ease = 0.22;
+        const nx = v.offsetX + (t.offsetX - v.offsetX) * ease;
+        const ny = v.offsetY + (t.offsetY - v.offsetY) * ease;
+        const ns = v.scale + (t.scale - v.scale) * ease;
+        const settled =
+          Math.abs(t.scale - ns) < 0.0008 && Math.abs(t.offsetX - nx) < 0.25 && Math.abs(t.offsetY - ny) < 0.25;
+        if (settled) {
+          zoomAnimRef.current = null;
+          return { ...t };
+        }
+        zoomAnimRef.current = requestAnimationFrame(step);
+        return { offsetX: nx, offsetY: ny, scale: ns };
+      });
+    }
+    zoomAnimRef.current = requestAnimationFrame(step);
+  }
+
+  function zoomBy(factor) {
+    const rect = containerRef.current.getBoundingClientRect();
+    const cx = rect.width / 2, cy = rect.height / 2; // zoom toward viewport center
+    const t = targetViewRef.current;
+    const worldX = (cx - t.offsetX) / t.scale;
+    const worldY = (cy - t.offsetY) / t.scale;
+    const newScale = Math.min(2.5, Math.max(0.25, t.scale * factor));
+    targetViewRef.current = { scale: newScale, offsetX: cx - worldX * newScale, offsetY: cy - worldY * newScale };
+    animateToTarget();
+  }
+
   function onWheel(e) {
     e.preventDefault();
     const rect = containerRef.current.getBoundingClientRect();
     const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-    const worldX = (mx - view.offsetX) / view.scale;
-    const worldY = (my - view.offsetY) / view.scale;
-    const factor = e.deltaY < 0 ? 1.1 : 0.9;
-    const newScale = Math.min(2.5, Math.max(0.25, view.scale * factor));
-    setView({ scale: newScale, offsetX: mx - worldX * newScale, offsetY: my - worldY * newScale });
+    const t = targetViewRef.current;
+    const worldX = (mx - t.offsetX) / t.scale;
+    const worldY = (my - t.offsetY) / t.scale;
+    const factor = Math.exp(-e.deltaY * 0.0015); // smaller, continuous steps feel less snappy than a flat +-10%
+    const newScale = Math.min(2.5, Math.max(0.25, t.scale * factor));
+    targetViewRef.current = { scale: newScale, offsetX: mx - worldX * newScale, offsetY: my - worldY * newScale };
+    animateToTarget();
   }
 
   function onPointerMove(e) {
     if (panRef.current) {
       const dx = e.clientX - panRef.current.startX, dy = e.clientY - panRef.current.startY;
       if (Math.abs(dx) + Math.abs(dy) > 3) movedRef.current = true;
-      setView((v) => ({ ...v, offsetX: panRef.current.offX + dx, offsetY: panRef.current.offY + dy }));
+      const offsetX = panRef.current.offX + dx, offsetY = panRef.current.offY + dy;
+      setView((v) => ({ ...v, offsetX, offsetY }));
+      targetViewRef.current = { ...targetViewRef.current, offsetX, offsetY };
       return;
     }
     if (draggingRef.current) {
@@ -378,7 +424,10 @@ export default function GraphCanvas() {
     openPanel(id);
   }
   function resetView() {
-    setView({ offsetX: 0, offsetY: 0, scale: 0.85 });
+    if (zoomAnimRef.current) { cancelAnimationFrame(zoomAnimRef.current); zoomAnimRef.current = null; }
+    const reset = { offsetX: 0, offsetY: 0, scale: 0.85 };
+    targetViewRef.current = reset;
+    setView(reset);
   }
 
   const matches = query.trim().toLowerCase();
@@ -414,8 +463,8 @@ export default function GraphCanvas() {
             />
           </div>
           <div className="ml-auto flex items-center gap-1">
-            <button onClick={() => setView((v) => ({ ...v, scale: Math.min(2.5, v.scale * 1.15) }))} className="rounded-md bg-neutral-800/90 hover:bg-neutral-700 p-1.5"><ZoomIn size={15} /></button>
-            <button onClick={() => setView((v) => ({ ...v, scale: Math.max(0.25, v.scale * 0.87) }))} className="rounded-md bg-neutral-800/90 hover:bg-neutral-700 p-1.5"><ZoomOut size={15} /></button>
+            <button onClick={() => zoomBy(1.35)} className="rounded-md bg-neutral-800/90 hover:bg-neutral-700 p-1.5"><ZoomIn size={15} /></button>
+            <button onClick={() => zoomBy(0.74)} className="rounded-md bg-neutral-800/90 hover:bg-neutral-700 p-1.5"><ZoomOut size={15} /></button>
             <button onClick={resetView} className="rounded-md bg-neutral-800/90 hover:bg-neutral-700 p-1.5"><Maximize2 size={15} /></button>
             <button onClick={clearSavedGraph} className="rounded-md bg-neutral-800/90 hover:bg-neutral-700 p-1.5" title="Reset graph"><Trash2 size={15} /></button>
           </div>
