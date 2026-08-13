@@ -18,8 +18,14 @@ import { Plus, Search, X, Link2, Trash2, ZoomIn, ZoomOut, Maximize2 } from "luci
  * to each other, panned/zoomed, searched, created, and deleted.
  *
  * No external physics library required — the simulation is ~40 lines of
- * plain JS below. Persistence (localStorage / API / DB) is intentionally
- * left as a single hook — see `persist()` — since that depends on your app.
+ * plain JS below. The graph auto-saves to localStorage (debounced) and
+ * reloads itself on mount, so notes/edges survive a refresh. To persist
+ * server-side instead, swap the body of `persist()` for an API/DB call —
+ * everything else stays the same.
+ *
+ * New notes auto-connect: on creation, a note links to whichever is
+ * closer — the nearest existing node, or the nearest point along an
+ * existing line (in which case it links to that line's nearer endpoint).
  */
 
 // ---------------------------------------------------------------------------
@@ -73,6 +79,60 @@ function degreeMap(nodes, edges) {
   return m;
 }
 
+// ---------------------------------------------------------------------------
+// localStorage persistence
+// ---------------------------------------------------------------------------
+const STORAGE_KEY = "graph-canvas:v1";
+
+function loadSavedGraph() {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed.nodes) || !Array.isArray(parsed.edges)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-connect: attach a freshly created node to whatever is nearby —
+// either the closest existing node, or the closest point along an existing
+// line (edge), in which case it links to that line's nearer endpoint.
+// ---------------------------------------------------------------------------
+function distToSegment(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const lenSq = dx * dx + dy * dy;
+  let t = lenSq === 0 ? 0 : ((px - ax) * dx + (py - ay) * dy) / lenSq;
+  t = Math.max(0, Math.min(1, t));
+  const cx = ax + t * dx, cy = ay + t * dy;
+  return Math.hypot(px - cx, py - cy);
+}
+
+function findAutoConnections(newNode, nodes, edges, maxLinks = 2) {
+  const best = new Map(); // id -> smallest distance found
+
+  nodes.forEach((n) => {
+    if (n.id === newNode.id) return;
+    const d = Math.hypot(n.x - newNode.x, n.y - newNode.y);
+    if (!best.has(n.id) || d < best.get(n.id)) best.set(n.id, d);
+  });
+
+  edges.forEach(({ source, target }) => {
+    const a = nodes.find((n) => n.id === source);
+    const b = nodes.find((n) => n.id === target);
+    if (!a || !b) return;
+    const d = distToSegment(newNode.x, newNode.y, a.x, a.y, b.x, b.y);
+    const nearerEnd =
+      Math.hypot(a.x - newNode.x, a.y - newNode.y) < Math.hypot(b.x - newNode.x, b.y - newNode.y) ? a.id : b.id;
+    if (!best.has(nearerEnd) || d < best.get(nearerEnd)) best.set(nearerEnd, d);
+  });
+
+  return [...best.entries()].sort((x, y) => x[1] - y[1]).slice(0, maxLinks).map(([id]) => id);
+}
+
 export default function GraphCanvas() {
   const containerRef = useRef(null);
   const rafRef = useRef(null);
@@ -80,13 +140,19 @@ export default function GraphCanvas() {
   const panRef = useRef(null); // {startX, startY, offX, offY}
   const movedRef = useRef(false);
 
-  const [nodes, setNodes] = useState(() =>
-    seedNodes.map((n, i) => {
+  const [nodes, setNodes] = useState(() => {
+    const saved = loadSavedGraph();
+    if (saved) return saved.nodes;
+    return seedNodes.map((n, i) => {
       const angle = (i / seedNodes.length) * Math.PI * 2;
       return { ...n, x: 500 + Math.cos(angle) * 260, y: 350 + Math.sin(angle) * 220, vx: 0, vy: 0 };
-    })
-  );
-  const [edges, setEdges] = useState(() => seedEdges.map(([source, target]) => ({ source, target })));
+    });
+  });
+  const [edges, setEdges] = useState(() => {
+    const saved = loadSavedGraph();
+    if (saved) return saved.edges;
+    return seedEdges.map(([source, target]) => ({ source, target }));
+  });
   const [view, setView] = useState({ offsetX: 0, offsetY: 0, scale: 0.85 });
   const [selected, setSelected] = useState(null); // node id shown in side panel
   const [linkMode, setLinkMode] = useState(false);
@@ -96,12 +162,34 @@ export default function GraphCanvas() {
 
   const degrees = degreeMap(nodes, edges);
 
-  // ---- persistence hook -----------------------------------------------
-  // Wire this up to localStorage / your API / a DB write. Kept a no-op here
-  // since browser storage isn't available in this preview sandbox.
+  // ---- persistence: debounced localStorage write ------------------------
+  // Swap the body of this for an API/DB call if you'd rather persist server
+  // side — everything else in the component stays the same either way.
+  const saveTimer = useRef(null);
   const persist = useCallback((_nodes, _edges) => {
-    // e.g. fetch("/api/graph", { method: "POST", body: JSON.stringify({ nodes: _nodes, edges: _edges }) })
+    if (typeof window === "undefined") return;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      try {
+        window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ nodes: _nodes, edges: _edges }));
+      } catch {
+        // storage full or unavailable (private browsing etc.) — fail silently
+      }
+    }, 300);
   }, []);
+
+  // Auto-save whenever the graph changes — covers drags, new/edited/deleted
+  // notes, and new links, without needing a persist() call at every site.
+  useEffect(() => {
+    persist(nodes, edges);
+  }, [nodes, edges, persist]);
+
+  function clearSavedGraph() {
+    if (typeof window === "undefined") return;
+    if (!window.confirm("Reset the graph back to the starter notes? This clears what's saved locally.")) return;
+    window.localStorage.removeItem(STORAGE_KEY);
+    window.location.reload();
+  }
 
   // ---- physics simulation ----------------------------------------------
   useEffect(() => {
@@ -277,11 +365,15 @@ export default function GraphCanvas() {
       containerRef.current.getBoundingClientRect().top + containerRef.current.clientHeight / 2
     );
     const node = { id, label: "New note", content: "", x: center.x + (Math.random() - 0.5) * 40, y: center.y + (Math.random() - 0.5) * 40, vx: 0, vy: 0 };
-    setNodes((prev) => {
-      const next = [...prev, node];
-      persist(next, edges);
-      return next;
-    });
+
+    // Auto-connect to whatever's closest — a nearby node, or a nearby line
+    // (in which case it links to that line's nearer endpoint).
+    const autoTargets = findAutoConnections(node, nodes, edges, 2);
+
+    setNodes((prev) => [...prev, node]);
+    if (autoTargets.length) {
+      setEdges((prev) => [...prev, ...autoTargets.map((target) => ({ source: id, target }))]);
+    }
     wake();
     openPanel(id);
   }
@@ -325,6 +417,7 @@ export default function GraphCanvas() {
             <button onClick={() => setView((v) => ({ ...v, scale: Math.min(2.5, v.scale * 1.15) }))} className="rounded-md bg-neutral-800/90 hover:bg-neutral-700 p-1.5"><ZoomIn size={15} /></button>
             <button onClick={() => setView((v) => ({ ...v, scale: Math.max(0.25, v.scale * 0.87) }))} className="rounded-md bg-neutral-800/90 hover:bg-neutral-700 p-1.5"><ZoomOut size={15} /></button>
             <button onClick={resetView} className="rounded-md bg-neutral-800/90 hover:bg-neutral-700 p-1.5"><Maximize2 size={15} /></button>
+            <button onClick={clearSavedGraph} className="rounded-md bg-neutral-800/90 hover:bg-neutral-700 p-1.5" title="Reset graph"><Trash2 size={15} /></button>
           </div>
         </div>
 
